@@ -1,0 +1,56 @@
+{
+  "name": "pi-notify",
+  "version": "1.0.0",
+  "description": "Нотификации о завершении работы агента Pi: звук и пуш на Windows, macOS и произвольный Linux-скрипт. Срабатывает на финальном settle прогона, текст передаётся через env-переменные.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "notification",
+    "push",
+    "sound",
+    "agent-end",
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/balamyt92/pi-notify.git"
+  },
+  "homepage": "https://github.com/balamyt92/pi-notify#readme",
+  "bugs": {
+    "url": "https://github.com/balamyt92/pi-notify/issues"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "files": [
+    "index.ts",
+    "config.ts",
+    "notify.ts",
+    "exec.ts",
+    "assets/notify.mp3",
+    "config.example.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
