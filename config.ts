@@ -13,6 +13,8 @@
  * Контракт безопасности: текст уведомления НИКОГДА не интерполируется в
  * shell-команду. Он передаётся дочернему процессу через env-переменные
  * PI_NOTIFY_TITLE / PI_NOTIFY_MESSAGE / PI_NOTIFY_OUTCOME / PI_NOTIFY_DURATION.
+ * Текст вопроса идёт теми же переменными; PI_NOTIFY_KIND различает итог прогона
+ * ("run") и ожидающий ответа вопрос ("question").
  * Команды читают их сами (osascript `system attribute`, PowerShell `$env:`,
  * shell `"$VAR"`). Поэтому произвольный текст не может сломать кавычки или
  * инжектить команды.
@@ -51,6 +53,27 @@ export interface NotifyConfig {
 	notifyOn: Outcome[];
 	/** Заголовок уведомления. */
 	title: string;
+	/**
+	 * Нотифицировать о вопросе агента (инструмент ask_user_question ждёт ответа).
+	 * Вопрос не подчиняется `notifyOn` и `minDurationSeconds`: агент заблокирован
+	 * до ответа человека, граница settle по нему не наступит никогда.
+	 */
+	onQuestion: boolean;
+	/** Заголовок уведомления о вопросе. Отдельный от `title`, чтобы отличать в пуше. */
+	questionTitle: string;
+	/**
+	 * Нотифицировать только из сессии с UI (`ctx.hasUI`).
+	 *
+	 * Фоновый сабагент поднимает собственный рантайм расширений через
+	 * `createAgentSession` + `bindExtensions` без `uiContext`, поэтому его
+	 * `ctx.hasUI === false`, а у интерактивной сессии — true. Без этого флага
+	 * каждый сабагент шлёт собственный `agent_settled`-пуш: на N агентов N тостов.
+	 *
+	 * `false` возвращает прежнее поведение: печатать и из headless-сессий
+	 * (`pi -p`, сабагенты). Печатный режим и без UI, так что там сигнал вернётся
+	 * только этим флагом.
+	 */
+	requireUI: boolean;
 	/**
 	 * Файл звука. `null`/пусто → встроенный asset `assets/notify.mp3`.
 	 * Можно задать свой путь (WSL или Windows). В WSL путь конвертируется в UNC,
@@ -130,6 +153,7 @@ export const WSL_PASSTHROUGH_VARS = [
 	"PI_NOTIFY_MESSAGE",
 	"PI_NOTIFY_OUTCOME",
 	"PI_NOTIFY_DURATION",
+	"PI_NOTIFY_KIND",
 	"PI_NOTIFY_SOUND_FILE",
 	"PI_NOTIFY_SOUND_DURATION",
 	"PI_NOTIFY_SOUND_VOLUME",
@@ -167,6 +191,9 @@ export const DEFAULT_CONFIG: NotifyConfig = {
 	minDurationSeconds: 0,
 	notifyOn: [...ALL_OUTCOMES],
 	title: "Pi",
+	onQuestion: true,
+	questionTitle: "Pi: вопрос",
+	requireUI: true,
 	soundFile: null,
 	soundDurationMs: 5000,
 	volume: 0.4,
@@ -227,6 +254,12 @@ export function mergeConfig(fileObj: unknown, defaults: NotifyConfig): NotifyCon
 				: defaults.minDurationSeconds,
 		notifyOn: normalizeNotifyOn(fileObj.notifyOn, defaults.notifyOn),
 		title: typeof fileObj.title === "string" && fileObj.title.length > 0 ? fileObj.title : defaults.title,
+		onQuestion: typeof fileObj.onQuestion === "boolean" ? fileObj.onQuestion : defaults.onQuestion,
+		questionTitle:
+			typeof fileObj.questionTitle === "string" && fileObj.questionTitle.length > 0
+				? fileObj.questionTitle
+				: defaults.questionTitle,
+		requireUI: typeof fileObj.requireUI === "boolean" ? fileObj.requireUI : defaults.requireUI,
 		soundFile:
 			typeof fileObj.soundFile === "string" && fileObj.soundFile.length > 0
 				? fileObj.soundFile
@@ -266,6 +299,11 @@ export function applyEnvOverrides(
 	out.sound = boolFromEnv(env.PI_NOTIFY_SOUND, out.sound);
 	out.push = boolFromEnv(env.PI_NOTIFY_PUSH, out.push);
 	if (env.PI_NOTIFY_TITLE && env.PI_NOTIFY_TITLE.length > 0) out.title = env.PI_NOTIFY_TITLE;
+	out.onQuestion = boolFromEnv(env.PI_NOTIFY_QUESTION, out.onQuestion);
+	out.requireUI = boolFromEnv(env.PI_NOTIFY_REQUIRE_UI, out.requireUI);
+	if (env.PI_NOTIFY_QUESTION_TITLE && env.PI_NOTIFY_QUESTION_TITLE.length > 0) {
+		out.questionTitle = env.PI_NOTIFY_QUESTION_TITLE;
+	}
 	if (env.PI_NOTIFY_SOUND_FILE && env.PI_NOTIFY_SOUND_FILE.length > 0) out.soundFile = env.PI_NOTIFY_SOUND_FILE;
 	if (env.PI_NOTIFY_SOUND_DURATION) {
 		const n = Number(env.PI_NOTIFY_SOUND_DURATION);

@@ -10,8 +10,10 @@ import {
 	buildPlan,
 	buildWslPassthrough,
 	commandFor,
+	extractQuestions,
 	lastAssistantText,
 	outcomeFromMessages,
+	questionMessage,
 	shouldNotify,
 	summarize,
 	truncate,
@@ -97,13 +99,14 @@ test("shouldNotify: all gates pass → true", () => {
 	assert.equal(shouldNotify({ enabled: true, notifyOn: ["completed", "aborted"], minDurationSeconds: 3 }, "aborted", 4), true);
 });
 
-test("buildEnv: carries all four fields, duration rounded", () => {
+test("buildEnv: carries all fields, duration rounded, kind defaults to run", () => {
 	const env = buildEnv({ title: "Заголовок", message: "Тело", outcome: "error", durationSeconds: 12.6 });
 	assert.deepEqual(env, {
 		PI_NOTIFY_TITLE: "Заголовок",
 		PI_NOTIFY_MESSAGE: "Тело",
 		PI_NOTIFY_OUTCOME: "error",
 		PI_NOTIFY_DURATION: "13",
+		PI_NOTIFY_KIND: "run",
 	});
 });
 
@@ -181,4 +184,47 @@ test("buildPlan: unknown/empty platform command → null channel", () => {
 	const plan = buildPlan(cfg, "linux");
 	assert.equal(plan.sound, null);
 	assert.ok(plan.push);
+});
+
+test("extractQuestions: только валидные вопросы, мусор отсеивается", () => {
+	assert.deepEqual(extractQuestions(undefined), []);
+	assert.deepEqual(extractQuestions(null), []);
+	assert.deepEqual(extractQuestions({}), []);
+	assert.deepEqual(extractQuestions({ questions: "nope" }), []);
+	assert.deepEqual(extractQuestions({ questions: [null, 1, {}, { question: "   " }] }), []);
+
+	const qs = extractQuestions({
+		questions: [
+			{ question: " Как? ", header: " ", multiSelect: true },
+			{ question: "Второй?" },
+		],
+	});
+	assert.equal(qs.length, 2);
+	assert.equal(qs[0].question, "Как?");
+	assert.equal(qs[0].header, "");
+	assert.equal(qs[0].multiSelect, true);
+	assert.equal(qs[1].multiSelect, false);
+});
+
+test("questionMessage: header-чип, счётчик остальных, фолбэк на мусоре", () => {
+	assert.equal(questionMessage({ questions: [{ question: "Брать Redis?", header: "Кэш" }] }), "Кэш: Брать Redis?");
+	assert.equal(questionMessage({ questions: [{ question: "Без чипа?" }] }), "Без чипа?");
+	assert.equal(
+		questionMessage({ questions: [{ question: "a" }, { question: "b" }, { question: "c" }] }),
+		"a (+2)",
+	);
+	// Пустой/битый payload — сигнал всё равно нужен.
+	assert.equal(questionMessage(undefined), "Агент ждёт ответа");
+	assert.equal(questionMessage({ questions: [] }), "Агент ждёт ответа");
+	// Тело режется по лимиту пуша.
+	const long = questionMessage({ questions: [{ question: "x".repeat(500) }] }, 50);
+	assert.equal(long.length, 50);
+	assert.ok(long.endsWith("…"));
+});
+
+test("buildEnv: kind по умолчанию run, question проходит наружу", () => {
+	const base = { title: "t", message: "m", outcome: "completed" as const, durationSeconds: 1 };
+	assert.equal(buildEnv(base).PI_NOTIFY_KIND, "run");
+	assert.equal(buildEnv({ ...base, kind: "question" }).PI_NOTIFY_KIND, "question");
+	assert.ok(WSL_PASSTHROUGH_VARS.includes("PI_NOTIFY_KIND"), "KIND пробрасывается в WSL");
 });

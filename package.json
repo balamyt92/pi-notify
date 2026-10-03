@@ -1,7 +1,7 @@
 {
   "name": "pi-notify",
-  "version": "1.0.0",
-  "description": "Нотификации о завершении работы агента Pi: звук и пуш на Windows, macOS и произвольный Linux-скрипт. Срабатывает на финальном settle прогона, текст передаётся через env-переменные.",
+  "version": "1.1.0",
+  "description": "Нотификации Pi: звук и пуш на Windows, macOS и произвольный Linux-скрипт. Срабатывает на финальном settle прогона и на вопросе агента (ask_user_question), текст передаётся через env-переменные.",
   "keywords": [
     "pi-package",
     "pi-extension",

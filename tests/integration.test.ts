@@ -29,7 +29,7 @@ mkdirSync(agentDir, { recursive: true });
 const dumpScript = join(base, "dump.sh");
 writeFileSync(
 	dumpScript,
-	`#!/bin/sh\necho "$1|$PI_NOTIFY_TITLE|$PI_NOTIFY_MESSAGE|$PI_NOTIFY_OUTCOME|$PI_NOTIFY_DURATION" >> "$DUMP_TO"\n`,
+	`#!/bin/sh\necho "$1|$PI_NOTIFY_TITLE|$PI_NOTIFY_MESSAGE|$PI_NOTIFY_OUTCOME|$PI_NOTIFY_DURATION|$PI_NOTIFY_KIND" >> "$DUMP_TO"\n`,
 	{ mode: 0o755 },
 );
 
@@ -47,6 +47,8 @@ type Handler = (event: any, ctx: any) => any;
 function makeMockPi() {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, any>();
+	// Кросс-экстеншеновая шина pi.events: канал → подписчики.
+	const bus = new Map<string, ((payload: unknown) => void)[]>();
 	const pi = {
 		on(event: string, handler: Handler) {
 			if (!handlers.has(event)) handlers.set(event, []);
@@ -56,14 +58,29 @@ function makeMockPi() {
 		registerCommand(name: string, opts: any) {
 			commands.set(name, opts);
 		},
+		events: {
+			on(channel: string, handler: (payload: unknown) => void) {
+				if (!bus.has(channel)) bus.set(channel, []);
+				bus.get(channel)!.push(handler);
+				return () => {
+					bus.set(channel, (bus.get(channel) ?? []).filter((h) => h !== handler));
+				};
+			},
+			emit(channel: string, payload: unknown) {
+				for (const h of bus.get(channel) ?? []) h(payload);
+			},
+		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, commands };
+	return { pi, handlers, commands, bus };
 }
 
-const ctx = { hasUI: false, mode: "print", ui: { notify: () => {} } } as any;
+// Интерактивная сессия: у неё есть UI, поэтому сигналы проходят при requireUI.
+const ctx = { hasUI: true, mode: "tui", ui: { notify: () => {} } } as any;
+// Headless-рантайм фонового сабагента: bindExtensions без uiContext → hasUI false.
+const headlessCtx = { hasUI: false, mode: "print", ui: { notify: () => {} } } as any;
 
-async function fire(handlers: Map<string, Handler[]>, event: any) {
-	for (const h of handlers.get(event.type) ?? []) await h(event, ctx);
+async function fire(handlers: Map<string, Handler[]>, event: any, useCtx: any = ctx) {
+	for (const h of handlers.get(event.type) ?? []) await h(event, useCtx);
 }
 
 /** Чистим PI_NOTIFY_* и ставим изолированный agent-dir + дамп-файл. */
@@ -184,4 +201,128 @@ test("registers /notify-test and /notify-status commands", async () => {
 	factory(pi);
 	assert.ok(commands.has("notify-test"));
 	assert.ok(commands.has("notify-status"));
+});
+
+test("end-to-end: вопрос агента стреляет вне minDurationSeconds", async () => {
+	const out = join(base, "out5.txt");
+	setupEnv(out);
+	// Порог 9999с не должен глушить вопрос: агент заблокирован до ответа.
+	writeConfig({
+		enabled: true,
+		sound: false,
+		push: true,
+		minDurationSeconds: 9999,
+		questionTitle: "Pi: вопрос",
+		commands: { [plat]: { push: `${dumpScript} push` } },
+	});
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers, bus } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" });
+	await fire(handlers, { type: "agent_start" });
+	assert.equal(bus.has("rpiv:ask-user:prompt"), true, "расширение подписано на канал вопроса");
+	(pi.events as any).emit("rpiv:ask-user:prompt", {
+		questions: [{ question: "Брать Redis?", header: "Кэш", multiSelect: false, options: [] }],
+	});
+
+	const ok = await waitFor(() => /push\|/.test(dump(out)));
+	assert.ok(ok, `expected push on question, got: ${dump(out)}`);
+	assert.match(dump(out), /push\|Pi: вопрос\|Кэш: Брать Redis\?\|completed\|\d+\|question/);
+	// settle по вопросу не наступал — итог прогона не дублируется.
+	await fire(handlers, { type: "agent_settled" });
+	const doubled = await waitFor(() => (dump(out).match(/push\|/g) ?? []).length > 1, 300);
+	assert.equal(doubled, false, "settle без agent_end не должен удвоить пуш");
+});
+
+test("end-to-end: onQuestion=false глушит вопрос, enabled=false — тоже", async () => {
+	for (const cfg of [{ onQuestion: false }, { enabled: false }]) {
+		const out = join(base, `out6-${Object.keys(cfg)[0]}.txt`);
+		setupEnv(out);
+		writeConfig({ push: true, sound: false, commands: { [plat]: { push: `${dumpScript} push` } }, ...cfg });
+
+		const { default: factory } = await import("../index.ts");
+		const { pi } = makeMockPi();
+		factory(pi);
+
+		(pi.events as any).emit("rpiv:ask-user:prompt", { questions: [{ question: "Тихо?" }] });
+		const appeared = await waitFor(() => existsSync(out), 300);
+		assert.equal(appeared, false, `ничего не должно быть при ${JSON.stringify(cfg)}`);
+	}
+});
+
+test("end-to-end: битый payload вопроса всё равно даёт сигнал, duration 0 до agent_start", async () => {
+	const out = join(base, "out7.txt");
+	setupEnv(out);
+	writeConfig({
+		enabled: true,
+		sound: false,
+		push: true,
+		commands: { [plat]: { push: `${dumpScript} push` } },
+	});
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" });
+	// Битый payload тоже должен дать сигнал, а не молча упасть.
+	(pi.events as any).emit("rpiv:ask-user:prompt", { questions: [] });
+
+	const ok = await waitFor(() => /push\|/.test(dump(out)));
+	assert.ok(ok, `expected push on empty payload, got: ${dump(out)}`);
+	assert.match(dump(out), /push\|Pi: вопрос\|Агент ждёт ответа\|completed\|0\|question/);
+});
+
+test("end-to-end: headless-сессия сабагента молчит при requireUI (default)", async () => {
+	const out = join(base, "out8.txt");
+	setupEnv(out);
+	writeConfig({
+		enabled: true,
+		sound: false,
+		push: true,
+		commands: { [plat]: { push: `${dumpScript} push` } },
+	});
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	// Имитация фонового сабагента: все события приходят с ctx без UI.
+	await fire(handlers, { type: "session_start" } as any, headlessCtx);
+	await fire(handlers, { type: "agent_start" }, headlessCtx);
+	(pi.events as any).emit("rpiv:ask-user:prompt", { questions: [{ question: "Тихо?" }] });
+	await fire(handlers, { type: "agent_end", messages: [{ role: "assistant", stopReason: "end_turn", content: "готов" }] }, headlessCtx);
+	await fire(handlers, { type: "agent_before_settle", outcome: "completed" }, headlessCtx);
+	await fire(handlers, { type: "agent_settled" }, headlessCtx);
+
+	const appeared = await waitFor(() => existsSync(out), 300);
+	assert.equal(appeared, false, `ни вопроса, ни итога из headless-сессии: ${dump(out)}`);
+});
+
+test("end-to-end: requireUI=false возвращает сигналы из headless-сессии", async () => {
+	const out = join(base, "out9.txt");
+	setupEnv(out);
+	writeConfig({
+		enabled: true,
+		sound: false,
+		push: true,
+		requireUI: false,
+		commands: { [plat]: { push: `${dumpScript} push` } },
+	});
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, headlessCtx);
+	await fire(handlers, { type: "agent_start" }, headlessCtx);
+	await fire(handlers, { type: "agent_end", messages: [{ role: "assistant", stopReason: "end_turn", content: "из сабагента" }] }, headlessCtx);
+	await fire(handlers, { type: "agent_before_settle", outcome: "completed" }, headlessCtx);
+	await fire(handlers, { type: "agent_settled" }, headlessCtx);
+
+	const ok = await waitFor(() => /push\|/.test(dump(out)));
+	assert.ok(ok, `requireUI=false должен печатать и без UI, got: ${dump(out)}`);
+	assert.match(dump(out), /push\|Pi\|из сабагента\|completed\|\d+\|run/);
 });

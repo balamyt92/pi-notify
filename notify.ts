@@ -20,6 +20,59 @@ export interface RunSummary {
 }
 
 /**
+ * Что произошло: прогон завершился (`run`) или агент задал вопрос и ждёт ответа
+ * (`question`). Отдельно от `Outcome`, потому что на вопросе прогон не завершён.
+ */
+export type NotifyKind = "run" | "question";
+
+/**
+ * Канал `pi.events`, который публикует @juicesharp/rpiv-ask-user-question, пока
+ * анкета ждёт ответа. Контракт пакета: имена каналов неизменяемы, payload
+ * дополняемый (новые поля приходят опциональными), поэтому читаем его толерантно.
+ */
+export const ASK_USER_PROMPT_CHANNEL = "rpiv:ask-user:prompt";
+
+/** Форма вопроса, которую мы ожидаем в payload канала. */
+export interface AskQuestionLite {
+	question: string;
+	header?: string;
+	multiSelect?: boolean;
+}
+
+/** Разобрать payload канала в список вопросов. Мусор и не-массив → пустой список. */
+export function extractQuestions(payload: unknown): AskQuestionLite[] {
+	const raw = (payload as { questions?: unknown } | null | undefined)?.questions;
+	if (!Array.isArray(raw)) return [];
+	const out: AskQuestionLite[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") continue;
+		const q = item as { question?: unknown; header?: unknown; multiSelect?: unknown };
+		if (typeof q.question !== "string" || q.question.trim().length === 0) continue;
+		out.push({
+			question: q.question.trim(),
+			header: typeof q.header === "string" ? q.header.trim() : undefined,
+			multiSelect: q.multiSelect === true,
+		});
+	}
+	return out;
+}
+
+/**
+ * Тело уведомления о вопросе: первый вопрос с header-чипом плюс счётчик
+ * остальных. Пустой или неразобранный payload даёт нейтральный текст — сигнал
+ * важнее формата, агент точно ждёт ответа, раз канал сработал.
+ */
+export function questionMessage(payload: unknown, max = 200): string {
+	const questions = extractQuestions(payload);
+	if (questions.length === 0) return "Агент ждёт ответа";
+	const first = questions[0];
+	const head = first.header ? `${first.header}: ${first.question}` : first.question;
+	const tail = questions.length > 1 ? ` (+${questions.length - 1})` : "";
+	const text = `${head}${tail}`.trim();
+	return truncate(text, max);
+}
+
+/**
  * Итог по последнему assistant-сообщению.
  * stopReason: "aborted" → aborted, "error" → error, иначе completed.
  * Пустой список или отсутствие assistant-сообщения → completed (агент отработал).
@@ -123,6 +176,8 @@ export interface NotifyPayload {
 	message: string;
 	outcome: Outcome;
 	durationSeconds: number;
+	/** Что случилось; по умолчанию — итог прогона. */
+	kind?: NotifyKind;
 	/** Разрешённый путь к звуку (уже Windows-UNC для WSL). */
 	soundFile?: string;
 	/** Длительность keep-alive плеера, мс. */
@@ -142,6 +197,7 @@ export function buildEnv(p: NotifyPayload): Record<string, string> {
 		PI_NOTIFY_MESSAGE: p.message,
 		PI_NOTIFY_OUTCOME: p.outcome,
 		PI_NOTIFY_DURATION: String(Math.round(p.durationSeconds)),
+		PI_NOTIFY_KIND: p.kind ?? "run",
 	};
 	if (p.soundFile) env.PI_NOTIFY_SOUND_FILE = p.soundFile;
 	if (p.soundDurationMs != null) env.PI_NOTIFY_SOUND_DURATION = String(Math.round(p.soundDurationMs));

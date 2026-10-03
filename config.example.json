@@ -9,6 +9,9 @@
     "error"
   ],
   "title": "Pi",
+  "onQuestion": true,
+  "questionTitle": "Pi: вопрос",
+  "requireUI": true,
   "soundFile": null,
   "soundDurationMs": 5000,
   "volume": 0.4,

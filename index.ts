@@ -10,10 +10,20 @@
  *                        при каждой retry-итерации — нужен последний)
  *   agent_before_settle→ авторитетный итог (completed/aborted/error)
  *   agent_settled      → финальный триггер: Pi больше не продолжит сам, шлём
+ *   rpiv:ask-user:prompt (pi.events) → агент задал вопрос и ждёт ответа;
+ *                        отдельный триггер, вне notifyOn и minDurationSeconds
+ *
+ * Оба триггера пропускаются, если `requireUI` включён и у сессии нет UI
+ * (`ctx.hasUI === false`). Так молчат headless-рантаймы фоновых сабагентов:
+ * каждый из них поднимает свой экземпляр расширения и иначе слал бы свой пуш.
  *
  * agent_settled выбран точкой выстрела, потому что это единственная граница,
  * после которой гарантированно нет авто-retry/compaction/queued-continuation.
  * agent_end стреляет и перед retry — уведомлять на нём значило бы дублировать.
+ *
+ * Вопрос — не итог прогона, а отдельная блокировка: пока человек не ответил,
+ * settle не наступит, и без отдельного хука уведомление по фоновому агенту
+ * не приходило бы вовсе.
  *
  * Конфиг: ~/.pi/agent/notify.json (пер-машинный), поверх — env PI_NOTIFY_*.
  * Текст уведомления передаётся дочерним процессам только через env, не через
@@ -22,7 +32,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { currentPlatform, loadConfig, resolveSoundFile, type NotifyConfig, type Outcome } from "./config.ts";
-import { buildEnv, buildPlan, shouldNotify, summarize } from "./notify.ts";
+import { buildEnv, buildPlan, shouldNotify, summarize, questionMessage, ASK_USER_PROMPT_CHANNEL, type NotifyKind } from "./notify.ts";
 import { runPlan } from "./exec.ts";
 
 export default function (pi: ExtensionAPI): void {
@@ -34,7 +44,13 @@ export default function (pi: ExtensionAPI): void {
 	let lastOutcome: Outcome = "completed";
 	let lastMessage = "";
 
-	function fire(title: string, message: string, outcome: Outcome, durationSeconds: number): void {
+	function fire(
+		title: string,
+		message: string,
+		outcome: Outcome,
+		durationSeconds: number,
+		kind: NotifyKind = "run",
+	): void {
 		const plan = buildPlan(cfg, platform);
 		if (!plan.sound && !plan.push) return;
 		const env = buildEnv({
@@ -42,6 +58,7 @@ export default function (pi: ExtensionAPI): void {
 			message,
 			outcome,
 			durationSeconds,
+			kind,
 			soundFile: plan.sound ? resolveSoundFile(cfg, platform) : undefined,
 			soundDurationMs: cfg.soundDurationMs,
 			volume: cfg.volume,
@@ -64,6 +81,21 @@ export default function (pi: ExtensionAPI): void {
 	function ctx_notify(msg: string, level: "info" | "warning" | "error"): void {
 		if (lastCtx?.hasUI) lastCtx.ui.notify(msg, level);
 	}
+
+	/**
+	 * Пускать ли сигнал из этой сессии. При `requireUI` молчим там, где UI нет:
+	 * это headless-рантаймы фоновых сабагентов и печатный режим. Отсутствие ctx
+	 * трактуем как «UI нет» — сигнал из ниоткуда хуже, чем тишина.
+	 */
+	function uiAllowed(ctx?: ExtensionContext): boolean {
+		return !cfg.requireUI || ctx?.hasUI === true;
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		// Самый ранний момент, где ctx уже есть: нужен, чтобы вопрос до первого
+		// agent_start тоже решался по requireUI, а не молчал из-за пустого ctx.
+		lastCtx = ctx;
+	});
 
 	pi.on("agent_start", (_event, ctx) => {
 		lastCtx = ctx;
@@ -95,8 +127,26 @@ export default function (pi: ExtensionAPI): void {
 		lastOutcome = "completed";
 		lastMessage = "";
 
+		if (!uiAllowed(ctx)) return;
 		if (!shouldNotify(cfg, outcome, durationSeconds)) return;
 		fire(cfg.title, message, outcome, durationSeconds);
+	});
+
+	// Вопрос от инструмента ask_user_question. Канал публикует
+	// @juicesharp/rpiv-ask-user-question в момент, когда вопрос показан
+	// пользователю и ждёт ответа. Порог длительности и notifyOn здесь не
+	// применяются: агент заблокирован, ждать более позднего момента
+	// бессмысленно. `enabled` и `onQuestion` по-прежнему глушат сигнал.
+	// Подписка живёт на event-шине того рантайма расширений, где загружено
+	// расширение, — фоновый сабагент со своим рантаймом уведомляет сам себя.
+	const unsubscribeAsk = pi.events.on(ASK_USER_PROMPT_CHANNEL, (payload: unknown) => {
+		if (!cfg.enabled || !cfg.onQuestion || !uiAllowed(lastCtx)) return;
+		const start = runStartMs;
+		const durationSeconds = start === undefined ? 0 : (Date.now() - start) / 1000;
+		fire(cfg.questionTitle, questionMessage(payload), "completed", durationSeconds, "question");
+	});
+	pi.on("session_shutdown", () => {
+		unsubscribeAsk();
 	});
 
 	// /notify-test — мгновенно слать тестовое уведомление текущему платформенному
@@ -143,6 +193,8 @@ export default function (pi: ExtensionAPI): void {
 			const lines = [
 				`enabled=${cfg.enabled} sound=${cfg.sound} push=${cfg.push}`,
 				`minDuration=${cfg.minDurationSeconds}s notifyOn=${cfg.notifyOn.join(",")}`,
+				`onQuestion=${cfg.onQuestion} questionTitle="${cfg.questionTitle}"`,
+				`requireUI=${cfg.requireUI} (hasUI=${ctx.hasUI})`,
 				`title="${cfg.title}" platform=${platform}`,
 				`sound cmd: ${plan.sound ?? "(нет)"}`,
 				`push  cmd: ${plan.push ?? "(нет)"}`,

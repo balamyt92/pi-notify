@@ -39,6 +39,37 @@ test("applyEnvOverrides: PI_NOTIFY_VOLUME", () => {
 	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_VOLUME: "abc" }).volume, DEFAULT_CONFIG.volume);
 });
 
+test("mergeConfig: onQuestion / questionTitle из файла, дефолты иначе", () => {
+	assert.equal(DEFAULT_CONFIG.onQuestion, true);
+	assert.equal(mergeConfig({}, DEFAULT_CONFIG).onQuestion, true);
+	assert.equal(mergeConfig({ onQuestion: false }, DEFAULT_CONFIG).onQuestion, false);
+	// не-boolean игнорируется
+	assert.equal(mergeConfig({ onQuestion: "no" }, DEFAULT_CONFIG).onQuestion, true);
+
+	assert.equal(mergeConfig({ questionTitle: "Вопрос" }, DEFAULT_CONFIG).questionTitle, "Вопрос");
+	// пустая строка не перебивает дефолт
+	assert.equal(mergeConfig({ questionTitle: "" }, DEFAULT_CONFIG).questionTitle, DEFAULT_CONFIG.questionTitle);
+});
+
+test("applyEnvOverrides: PI_NOTIFY_QUESTION / PI_NOTIFY_QUESTION_TITLE", () => {
+	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_QUESTION: "0" }).onQuestion, false);
+	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_QUESTION: "false" }).onQuestion, false);
+	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, {}).onQuestion, true);
+	assert.equal(
+		applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_QUESTION_TITLE: "Среда" }).questionTitle,
+		"Среда",
+	);
+	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_QUESTION_TITLE: "" }).questionTitle, DEFAULT_CONFIG.questionTitle);
+});
+
+test("mergeConfig / env: requireUI", () => {
+	assert.equal(DEFAULT_CONFIG.requireUI, true);
+	assert.equal(mergeConfig({ requireUI: false }, DEFAULT_CONFIG).requireUI, false);
+	assert.equal(mergeConfig({ requireUI: "no" }, DEFAULT_CONFIG).requireUI, true);
+	assert.equal(applyEnvOverrides(DEFAULT_CONFIG, { PI_NOTIFY_REQUIRE_UI: "0" }).requireUI, false);
+	assert.equal(applyEnvOverrides({ ...DEFAULT_CONFIG, requireUI: false }, {}).requireUI, false);
+});
+
 test("wslPathToWindows: WSL-путь → UNC, windows-путь как есть", () => {
 	assert.equal(
 		wslPathToWindows("/home/u/proj/a.mp3", "Ubuntu"),
