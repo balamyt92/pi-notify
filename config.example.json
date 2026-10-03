@@ -12,6 +12,11 @@
   "onQuestion": true,
   "questionTitle": "Pi: вопрос",
   "requireUI": true,
+  "onlyWhenUnfocused": true,
+  "focusedGraceSeconds": 60,
+  "presenceWindowSeconds": 10,
+  "focusFallback": true,
+  "focusQueryTimeoutMs": 2000,
   "soundFile": null,
   "soundDurationMs": 5000,
   "volume": 0.4,
@@ -30,7 +35,8 @@
     },
     "linux": {
       "sound": "paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || aplay /usr/share/sounds/alsa/Complete.oga 2>/dev/null || true",
-      "push": "notify-send \"$PI_NOTIFY_TITLE\" \"$PI_NOTIFY_MESSAGE\""
+      "push": "notify-send \"$PI_NOTIFY_TITLE\" \"$PI_NOTIFY_MESSAGE\"",
+      "focus": "case \"$(xdotool getactivewindow getwindowname 2>/dev/null)\" in *'мой терминал'*) exit 0;; *) exit 1;; esac"
     }
   }
 }

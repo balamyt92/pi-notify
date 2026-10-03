@@ -8,6 +8,7 @@ import {
 	applyEnvOverrides,
 	bundledSoundPath,
 	clampVolume,
+	currentPlatform,
 	DEFAULT_CONFIG,
 	DEFAULT_COMMANDS,
 	isWsl,
@@ -227,4 +228,82 @@ test("psEncode: produces valid UTF-16LE base64 roundtrip", () => {
 	const enc = psEncode(script);
 	const decoded = Buffer.from(enc, "base64").toString("utf16le");
 	assert.equal(decoded, script);
+});
+
+// --- фильтр по фокусу: ключи, дефолты, env -----------------------------------
+
+test("DEFAULT_CONFIG: дефолты фильтра по фокусу", () => {
+	assert.equal(DEFAULT_CONFIG.onlyWhenUnfocused, true);
+	assert.equal(DEFAULT_CONFIG.focusedGraceSeconds, 60);
+	assert.equal(DEFAULT_CONFIG.presenceWindowSeconds, 10);
+	assert.equal(DEFAULT_CONFIG.focusFallback, true);
+	assert.equal(DEFAULT_CONFIG.focusQueryTimeoutMs, 2000);
+});
+
+test("DEFAULT_COMMANDS: у каждой платформы есть команда запроса фокуса", () => {
+	for (const plat of ["darwin", "win32", "linux", "wsl"] as const) {
+		const cmd = DEFAULT_COMMANDS[plat].focus;
+		assert.equal(typeof cmd, "string", `${plat}: focus cmd задан`);
+		assert.ok((cmd ?? "").trim().length > 0, `${plat}: focus cmd непустой`);
+	}
+});
+
+test("mergeConfig: ключи фокуса из файла, с проверкой диапазона", () => {
+	const cfg = mergeConfig(
+		{ onlyWhenUnfocused: false, focusedGraceSeconds: 30, presenceWindowSeconds: 5, focusFallback: false, focusQueryTimeoutMs: 800 },
+		DEFAULT_CONFIG,
+	);
+	assert.equal(cfg.onlyWhenUnfocused, false);
+	assert.equal(cfg.focusedGraceSeconds, 30);
+	assert.equal(cfg.presenceWindowSeconds, 5);
+	assert.equal(cfg.focusFallback, false);
+	assert.equal(cfg.focusQueryTimeoutMs, 800);
+});
+
+test("mergeConfig: невалидные значения фокуса → дефолты", () => {
+	const cfg = mergeConfig(
+		{ onlyWhenUnfocused: "no", focusedGraceSeconds: -1, presenceWindowSeconds: "x", focusFallback: 1, focusQueryTimeoutMs: 0 },
+		DEFAULT_CONFIG,
+	);
+	assert.equal(cfg.onlyWhenUnfocused, DEFAULT_CONFIG.onlyWhenUnfocused);
+	assert.equal(cfg.focusedGraceSeconds, DEFAULT_CONFIG.focusedGraceSeconds);
+	assert.equal(cfg.presenceWindowSeconds, DEFAULT_CONFIG.presenceWindowSeconds);
+	assert.equal(cfg.focusFallback, DEFAULT_CONFIG.focusFallback);
+	assert.equal(cfg.focusQueryTimeoutMs, DEFAULT_CONFIG.focusQueryTimeoutMs);
+});
+
+test("mergeCommands: канал focus мержится поверх дефолтов", () => {
+	const cmds = mergeCommands({ linux: { focus: "exit 1" } }, DEFAULT_COMMANDS);
+	assert.equal(cmds.linux.focus, "exit 1");
+	assert.equal(cmds.linux.push, DEFAULT_COMMANDS.linux.push);
+	assert.equal(cmds.wsl.focus, DEFAULT_COMMANDS.wsl.focus);
+});
+
+test("applyEnvOverrides: фокус-ключи из окружения", () => {
+	const cfg = applyEnvOverrides(DEFAULT_CONFIG, {
+		PI_NOTIFY_ONLY_WHEN_UNFOCUSED: "0",
+		PI_NOTIFY_FOCUS_GRACE: "15",
+		PI_NOTIFY_FOCUS_PRESENCE: "3",
+		PI_NOTIFY_FOCUS_FALLBACK: "false",
+		PI_NOTIFY_FOCUS_TIMEOUT: "500",
+		PI_NOTIFY_CMD_FOCUS: "exit 0",
+	});
+	assert.equal(cfg.onlyWhenUnfocused, false);
+	assert.equal(cfg.focusedGraceSeconds, 15);
+	assert.equal(cfg.presenceWindowSeconds, 3);
+	assert.equal(cfg.focusFallback, false);
+	assert.equal(cfg.focusQueryTimeoutMs, 500);
+	// PI_NOTIFY_CMD_* относится к текущей платформе — её и проверяем.
+	assert.equal(cfg.commands[currentPlatform()].focus, "exit 0");
+});
+
+test("applyEnvOverrides: мусор в фокус-числах не меняет значения", () => {
+	const cfg = applyEnvOverrides(DEFAULT_CONFIG, {
+		PI_NOTIFY_FOCUS_GRACE: "abc",
+		PI_NOTIFY_FOCUS_PRESENCE: "-2",
+		PI_NOTIFY_FOCUS_TIMEOUT: "0",
+	});
+	assert.equal(cfg.focusedGraceSeconds, DEFAULT_CONFIG.focusedGraceSeconds);
+	assert.equal(cfg.presenceWindowSeconds, DEFAULT_CONFIG.presenceWindowSeconds);
+	assert.equal(cfg.focusQueryTimeoutMs, DEFAULT_CONFIG.focusQueryTimeoutMs);
 });

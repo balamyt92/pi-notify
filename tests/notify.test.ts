@@ -11,6 +11,7 @@ import {
 	buildWslPassthrough,
 	commandFor,
 	extractQuestions,
+	focusAllows,
 	lastAssistantText,
 	outcomeFromMessages,
 	questionMessage,
@@ -18,7 +19,7 @@ import {
 	summarize,
 	truncate,
 } from "../notify.ts";
-import { DEFAULT_CONFIG } from "../config.ts";
+import { DEFAULT_CONFIG, DEFAULT_COMMANDS } from "../config.ts";
 
 type Msg = { role: string; stopReason?: string; content?: unknown };
 
@@ -227,4 +228,35 @@ test("buildEnv: kind по умолчанию run, question проходит на
 	assert.equal(buildEnv(base).PI_NOTIFY_KIND, "run");
 	assert.equal(buildEnv({ ...base, kind: "question" }).PI_NOTIFY_KIND, "question");
 	assert.ok(WSL_PASSTHROUGH_VARS.includes("PI_NOTIFY_KIND"), "KIND пробрасывается в WSL");
+});
+
+// --- focusAllows: фильтр по присутстви ----------------------------------------
+
+const focusCfg = { onlyWhenUnfocused: true, focusedGraceSeconds: 60 };
+
+test("focusAllows: onlyWhenUnfocused=false игнорирует фокус и порог", () => {
+	assert.equal(focusAllows({ ...focusCfg, onlyWhenUnfocused: false }, { state: "focused", source: "terminal" }, 0), true);
+});
+
+test("focusAllows: вне фокуса сигнал проходит на любой длительности", () => {
+	assert.equal(focusAllows(focusCfg, { state: "unfocused", source: "terminal" }, 0), true);
+	assert.equal(focusAllows(focusCfg, { state: "unfocused", source: "query" }, 0.1), true);
+});
+
+test("focusAllows: в фокусе коротче порога тихо, не короче — сигнал", () => {
+	assert.equal(focusAllows(focusCfg, { state: "focused", source: "terminal" }, 59.9), false);
+	assert.equal(focusAllows(focusCfg, { state: "focused", source: "terminal" }, 60), true);
+	assert.equal(focusAllows(focusCfg, { state: "focused", source: "presence" }, 300), true);
+});
+
+test("focusAllows: unknown трактуется как «в фокусе»", () => {
+	assert.equal(focusAllows(focusCfg, { state: "unknown", source: "none" }, 5), false);
+	assert.equal(focusAllows(focusCfg, { state: "unknown", source: "none" }, 61), true);
+});
+
+test("commandFor: канал focus читается как остальные", () => {
+	const cfg = structuredClone(DEFAULT_CONFIG);
+	cfg.commands.linux = { ...cfg.commands.linux, focus: "exit 1" };
+	assert.equal(commandFor(cfg, "linux", "focus"), "exit 1");
+	assert.equal(commandFor(cfg, "darwin", "focus"), DEFAULT_COMMANDS.darwin.focus ?? null);
 });

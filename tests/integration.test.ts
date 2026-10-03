@@ -88,6 +88,10 @@ function setupEnv(outFile: string) {
 	for (const k of Object.keys(process.env)) {
 		if (k.startsWith("PI_NOTIFY")) delete process.env[k];
 	}
+	// Фильтр по фокусу глушим по умолчанию: эти тесты про каналы и текст, а не про
+	// присутствие. Без этого флага fallback-запрос поднимал бы реальный
+	// powershell.exe/xdotool на каждый тест, а короткие прогоны молчали бы.
+	process.env.PI_NOTIFY_ONLY_WHEN_UNFOCUSED = "0";
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.DUMP_TO = outFile;
 }
@@ -325,4 +329,149 @@ test("end-to-end: requireUI=false возвращает сигналы из headl
 	const ok = await waitFor(() => /push\|/.test(dump(out)));
 	assert.ok(ok, `requireUI=false должен печатать и без UI, got: ${dump(out)}`);
 	assert.match(dump(out), /push\|Pi\|из сабагента\|completed\|\d+\|run/);
+});
+
+// --- Фильтр по фокусу (onlyWhenUnfocused) -------------------------------------
+//
+// Терминальные события DECSET 1004 в тесте не воспроизвести (stdin не TUI),
+// поэтому проверяется связка через OS-fallback: подставная команда фокуса с
+// нужным кодом возврата. Разрешение «код → состояние» и порог длительности
+// покрываются здесь, чистая логика состояний — в focus.test.ts.
+
+/** Включить фильтр и вернуть конфиг с подставным OS-запросом фокуса. */
+function focusConfig(code: number | null, extra: Record<string, unknown> = {}) {
+	process.env.PI_NOTIFY_ONLY_WHEN_UNFOCUSED = "1";
+	return {
+		enabled: true,
+		sound: false,
+		push: true,
+		focusedGraceSeconds: 60,
+		commands: {
+			[plat]: {
+				push: `${dumpScript} push`,
+				// `exit N` как команда: spawn идёт через shell, код возврата — ответ.
+				...(code === null ? {} : { focus: `exit ${code}` }),
+			},
+		},
+		...extra,
+	};
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Прогон от start до settle с указанным итогом. */
+async function runCycle(handlers: Map<string, Handler[]>, text = "готово") {
+	await fire(handlers, { type: "agent_start" });
+	await fire(handlers, {
+		type: "agent_end",
+		messages: [{ role: "assistant", stopReason: "end_turn", content: [{ type: "text", text }] }],
+	});
+	await fire(handlers, { type: "agent_before_settle", outcome: "completed" });
+	await fire(handlers, { type: "agent_settled" });
+}
+
+test("focus: OS-запрос «не в фокусе» (exit 1) — сигнал проходит на коротком прогоне", async () => {
+	const out = join(base, "focus-out.txt");
+	setupEnv(out);
+	writeConfig(focusConfig(1));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await runCycle(handlers, "человек отошёл");
+
+	const ok = await waitFor(() => /push\|/.test(dump(out)));
+	assert.ok(ok, `ожидали сигнал при unfocused, got: ${dump(out)}`);
+});
+
+test("focus: «в фокусе» (exit 0) и короткий прогон — молчим", async () => {
+	const out = join(base, "focus-focused-short.txt");
+	setupEnv(out);
+	writeConfig(focusConfig(0));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await runCycle(handlers);
+
+	const appeared = await waitFor(() => existsSync(out), 500);
+	assert.equal(appeared, false, `в фокусе на коротком прогоне тихо: ${dump(out)}`);
+});
+
+test("focus: нет данных (exit 2) и короткий прогон — молчим", async () => {
+	const out = join(base, "focus-unknown-short.txt");
+	setupEnv(out);
+	writeConfig(focusConfig(2));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await runCycle(handlers);
+
+	const appeared = await waitFor(() => existsSync(out), 500);
+	assert.equal(appeared, false, `unknown трактуется как «в фокусе»: ${dump(out)}`);
+});
+
+test("focus: «в фокусе», но прогон дольше порога — сигнал проходит", async () => {
+	const out = join(base, "focus-focused-long.txt");
+	setupEnv(out);
+	writeConfig(focusConfig(0, { focusedGraceSeconds: 0.3 }));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await fire(handlers, { type: "agent_start" });
+	await sleep(400);
+	await fire(handlers, {
+		type: "agent_end",
+		messages: [{ role: "assistant", stopReason: "end_turn", content: "долгий ответ" }],
+	});
+	await fire(handlers, { type: "agent_before_settle", outcome: "completed" });
+	await fire(handlers, { type: "agent_settled" });
+
+	const ok = await waitFor(() => /push\|/.test(dump(out)));
+	assert.ok(ok, `прогон дольше порога сигналит даже в фокусе, got: ${dump(out)}`);
+});
+
+test("focus: вопрос агента тоже режется фильтром (в фокусе, коротко — тихо)", async () => {
+	const out = join(base, "focus-question.txt");
+	setupEnv(out);
+	writeConfig(focusConfig(0));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await fire(handlers, { type: "agent_start" });
+	(pi.events as any).emit("rpiv:ask-user:prompt", { questions: [{ question: "Ответить?" }] });
+
+	const appeared = await waitFor(() => existsSync(out), 500);
+	assert.equal(appeared, false, `вопрос в фокусе не должен сигналить: ${dump(out)}`);
+});
+
+test("focus: только что был ввод пользователя — сигнал не проходит (presence)", async () => {
+	const out = join(base, "focus-presence.txt");
+	setupEnv(out);
+	// Без OS-запроса: источник состояния — только ввод и терминал.
+	writeConfig(focusConfig(null, { focusFallback: false }));
+
+	const { default: factory } = await import("../index.ts");
+	const { pi, handlers } = makeMockPi();
+	factory(pi);
+
+	await fire(handlers, { type: "session_start" } as any, ctx);
+	await fire(handlers, { type: "input", text: "сделай", source: "interactive" });
+	await runCycle(handlers);
+
+	const appeared = await waitFor(() => existsSync(out), 500);
+	assert.equal(appeared, false, `свежий ввод = человек у клавиатуры: ${dump(out)}`);
 });

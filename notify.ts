@@ -10,7 +10,13 @@
  * интерполируется — инъекция через сообщение невозможна.
  */
 
-import { WSL_PASSTHROUGH_VARS, type NotifyConfig, type Outcome, type Platform } from "./config.ts";
+import {
+	WSL_PASSTHROUGH_VARS,
+	type NotifyConfig,
+	type Outcome,
+	type Platform,
+} from "./config.ts";
+import type { FocusView } from "./focus.ts";
 
 /** Извлечённый из прогона итог: статус + человекочитаемое сообщение. */
 export interface RunSummary {
@@ -159,10 +165,13 @@ export function shouldNotify(
  * Сохраняет уже заданные пользователем записи WSLENV, добавляя наши имена
  * без дублей. Без флагов значение передаётся как есть (без path-конвертации),
  * что нужно для произвольного текста.
+ *
+ * `extra` — дополнительные имена для конкретного запроса (например,
+ * PI_NOTIFY_FOCUS_PROCESSES нужен только запросу фокуса).
  */
-export function buildWslPassthrough(existing?: string): string {
+export function buildWslPassthrough(existing?: string, extra?: readonly string[]): string {
 	const parts = (existing ?? "").split(":").filter((s) => s.length > 0);
-	for (const name of WSL_PASSTHROUGH_VARS) {
+	for (const name of [...WSL_PASSTHROUGH_VARS, ...(extra ?? [])]) {
 		// Имя в WSLENV может быть с флагами: "NAME/p". Сравниваем базовую часть.
 		const base = parts.find((p) => p.split("/")[0] === name);
 		if (!base) parts.push(name);
@@ -208,13 +217,31 @@ export function buildEnv(p: NotifyPayload): Record<string, string> {
 }
 
 /**
- * Команды для платформы по текущему каналу.
- * kind: "sound" | "push". Пустая/отсутствующая строка → null (канал не играть).
+ * Разрешён ли сигнал по состоянию фокуса.
+ *
+ * Правило: вне фокуса — всегда; в фокусе — только если прогон не короче
+ * `focusedGraceSeconds`. `unknown` трактуется как «в фокусе» (отсутствие данных
+ * не повод шуметь), поэтому короткие прогоны при неизвестном фокусе молчат.
+ * При `onlyWhenUnfocused: false` фокус не учитывается.
+ */
+export function focusAllows(
+	cfg: Pick<NotifyConfig, "onlyWhenUnfocused" | "focusedGraceSeconds">,
+	view: FocusView,
+	durationSeconds: number,
+): boolean {
+	if (!cfg.onlyWhenUnfocused) return true;
+	if (view.state === "unfocused") return true;
+	return durationSeconds >= cfg.focusedGraceSeconds;
+}
+
+/**
+ * Собрать команды для платформы по текущему каналу.
+ * kind: "sound" | "push" | "focus". Пустая/отсутствующая строка → null (канал не играть).
  */
 export function commandFor(
 	cfg: NotifyConfig,
 	platform: Platform,
-	kind: "sound" | "push",
+	kind: "sound" | "push" | "focus",
 ): string | null {
 	const cmd = cfg.commands[platform]?.[kind];
 	if (typeof cmd !== "string") return null;

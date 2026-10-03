@@ -11,7 +11,8 @@
  * команда не должны ронять сессию. Диагностика — через onLog-колбэк.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 
 export interface RunOptions {
 	/** Env для дочернего процесса (поверх process.env). */
@@ -48,6 +49,75 @@ export function runCommand(
 		opts.onLog?.(channel, command, err instanceof Error ? err.message : String(err));
 		return false;
 	}
+}
+
+/** Результат дожидающегося запроса (в отличие от уведомительных — нам нужен код). */
+export interface CaptureResult {
+	/** Код возврата; null — процесс не запустился или убит сигналом. */
+	code: number | null;
+	signal: string | null;
+	timedOut: boolean;
+	stdout: string;
+	stderr: string;
+}
+
+/** Ограничение на объёт собираемого вывода, чтобы не растить память на болтливой команде. */
+const MAX_CAPTURE = 4096;
+
+/**
+ * Запустить команду и дождаться её кода возврата. Никогда не бросает: ошибка
+ * запуска и таймаут возвращаются в результате.
+ *
+ * В отличие от runCommand здесь НЕ detached и stdio собран: код возврата и есть
+ * ответ (см. focusStateFromExitCode). Таймаут нужен, чтобы медленный или
+ * зависший запрос фокуса не задерживал сигнал.
+ */
+export function runCapture(
+	command: string,
+	timeoutMs = 2000,
+	opts: { env?: Record<string, string> } = {},
+): Promise<CaptureResult> {
+	const empty: CaptureResult = { code: null, signal: null, timedOut: false, stdout: "", stderr: "" };
+	if (!command || command.trim().length === 0) return Promise.resolve(empty);
+	return new Promise<CaptureResult>((resolve) => {
+		let child: ChildProcessByStdio<null, Readable, Readable>;
+		try {
+			child = spawn(command, {
+				shell: true,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: opts.env ? { ...process.env, ...opts.env } : process.env,
+			});
+		} catch (err) {
+			resolve({ ...empty, stderr: err instanceof Error ? err.message : String(err) });
+			return;
+		}
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* процесс уже мог завершиться */
+			}
+		}, timeoutMs);
+		timer.unref?.();
+		child.stdout.on("data", (d) => {
+			if (stdout.length < MAX_CAPTURE) stdout += String(d);
+		});
+		child.stderr.on("data", (d) => {
+			if (stderr.length < MAX_CAPTURE) stderr += String(d);
+		});
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({ ...empty, timedOut, stdout: stdout.trim(), stderr: stderr.trim() || err.message });
+		});
+		child.on("close", (code, signal) => {
+			clearTimeout(timer);
+			resolve({ code, signal: signal ?? null, timedOut, stdout: stdout.trim(), stderr: stderr.trim() });
+		});
+	});
 }
 
 /**

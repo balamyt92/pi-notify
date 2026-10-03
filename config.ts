@@ -34,10 +34,16 @@ export type Outcome = "completed" | "aborted" | "error";
  */
 export type Platform = "darwin" | "win32" | "linux" | "wsl";
 
-/** Команды одного канала (звук или пуш) для одной платформы. */
+/** Команды одного канала (звук, пуш или запрос фокуса) для одной платформы. */
 export interface CommandSet {
 	sound?: string;
 	push?: string;
+	/**
+	 * Запрос «в фокусе ли терминал». Код возврата: 0 — в фокусе, 1 — нет,
+	 * 2 или любая ошибка — неизвестно. Используется только когда терминал
+	 * не прислал событий фокуса (DECSET 1004).
+	 */
+	focus?: string;
 }
 
 export interface NotifyConfig {
@@ -74,6 +80,35 @@ export interface NotifyConfig {
 	 * только этим флагом.
 	 */
 	requireUI: boolean;
+	/**
+	 * Сигналить только когда TUI не в фокусе.
+	 *
+	 * `true` (по умолчанию): в фокусе сигнал молчит, пока прогон короче
+	 * `focusedGraceSeconds`; вне фокуса сигналит сразу. Без данных о фокусе
+	 * состояние трактуется как «в фокусе» — короткие прогоны молчат.
+	 *
+	 * `false` — прежнее поведение: фокус не учитывается вовсе, слушатель stdin
+	 * и OS-запросы не поднимаются.
+	 */
+	onlyWhenUnfocused: boolean;
+	/**
+	 * Порог (сек): если прогон не короче него, сигнал уходит даже при фокусе.
+	 * Смысл — долгий ответ догнать звуком, а короткий не дублировать.
+	 */
+	focusedGraceSeconds: number;
+	/**
+	 * Сколько секунд после сообщения человека считать его у клавиатуры.
+	 * Косвенный признак для терминалов без DECSET 1004: нажал Enter — значит смотрел.
+	 */
+	presenceWindowSeconds: number;
+	/**
+	 * Опрашивать активное окно ОС, когда терминал и ввод не ответили.
+	 * Точнее, но это отдельный процесс (в WSL — powershell.exe, ~0.5 с).
+	 */
+	focusFallback: boolean;
+	/** Таймаут OS-запроса фокуса, мс. Таймаут — состояние «неизвестно».
+	 */
+	focusQueryTimeoutMs: number;
 	/**
 	 * Файл звука. `null`/пусто → встроенный asset `assets/notify.mp3`.
 	 * Можно задать свой путь (WSL или Windows). В WSL путь конвертируется в UNC,
@@ -159,28 +194,87 @@ export const WSL_PASSTHROUGH_VARS = [
 	"PI_NOTIFY_SOUND_VOLUME",
 ] as const;
 
+/**
+ * Имя для запроса фокуса: список имён процессов-терминалов поверх встроенного.
+ * Пробрасывается в Windows только для команды `commands.focus`, поэтому не входит
+ * в WSL_PASSTHROUGH_VARS: без объявления в WSLENV переменная границу interop
+ * не пересекает и PowerShell её не увидел бы.
+ */
+export const FOCUS_PASSTHROUGH_VAR = "PI_NOTIFY_FOCUS_PROCESSES";
+
+/**
+ * PowerShell-запрос активного окна: имя процесса foreground-окна сверяется со
+ * списком терминалов. Код 0 — терминал активен, 1 — активен другой процесс,
+ * 2 — определить не удалось.
+ *
+ * Список расширяется из `TERM_PROGRAM` и env `PI_NOTIFY_FOCUS_PROCESSES`
+ * (список имён через запятую; в WSL такую переменную надо объявить в WSLENV).
+ * Свой терминал с нестандартным именем задаётся переопределением `commands.focus`.
+ */
+const WIN_FOCUS_PS = [
+	"$ProgressPreference = 'SilentlyContinue'",
+	'Add-Type -Namespace PiNotify -Name FgWin -MemberDefinition \'[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint procId);\' | Out-Null',
+	"$h = [PiNotify.FgWin]::GetForegroundWindow()",
+	"$procId = [uint32]0",
+	"[void][PiNotify.FgWin]::GetWindowThreadProcessId($h, [ref]$procId)",
+	"$name = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName",
+	"if (-not $name) { exit 2 }",
+	"$known = @('wezterm-gui','WindowsTerminal','WindowsTerminalPreview','ConEmu','ConEmu64','Alacritty','mintty','Tabby','Hyper','PuTTY','cmder','Code','cursor','Warp','kitty','ghostty','rio')",
+	"if ($env:TERM_PROGRAM -eq 'WezTerm') { $known += 'wezterm-gui' }",
+	"if ($env:TERM_PROGRAM -eq 'vscode') { $known += 'Code' }",
+	"if ($env:PI_NOTIFY_FOCUS_PROCESSES) { $known += ($env:PI_NOTIFY_FOCUS_PROCESSES -split ',') }",
+	"if ($known -contains $name) { exit 0 }",
+	"exit 1",
+].join("\n");
+
+/**
+ * X11: активное окно → его pid → проверка, есть ли он среди предков нашего
+ * процесса (терминал всегда родитель оболочки). Нет xdotool или нет X — код 2.
+ * Wayland так не определяется: там xdotool не отвечает, и остаётся 1004.
+ */
+const LINUX_FOCUS_SH =
+	"pid=$(xdotool getactivewindow getwindowpid 2>/dev/null); [ -n \"$pid\" ] || exit 2; " +
+	"p=$$; while [ -n \"$p\" ] && [ \"$p\" -gt 0 ]; do [ \"$p\" = \"$pid\" ] && exit 0; " +
+	"p=$(sed -n 's/^PPid:[[:space:]]*\\([0-9]*\\).*/\\1/p' /proc/\"$p\"/status 2>/dev/null); done; " +
+	"[ -n \"$p\" ] || exit 2; exit 1";
+
+/**
+ * macOS: имя frontmost-приложения из System Events, сверяется со списком
+ * терминалов и с именами предков процесса. osascript недоступен — код 2.
+ */
+const DARWIN_FOCUS_SH =
+	"front=$(osascript -e 'tell application \"System Events\" to get name of first application process whose frontmost is true' 2>/dev/null); " +
+	'[ -n "$front" ] || exit 2; ' +
+	'case "$front" in Terminal|iTerm2|iTerm|WezTerm|kitty|Alacritty|Warp|Hyper|Ghostty|Code|Cursor) exit 0;; esac; ' +
+	"p=$$; while [ -n \"$p\" ] && [ \"$p\" -gt 0 ]; do c=$(ps -o comm= -p \"$p\" 2>/dev/null); " +
+	'case "$c" in *"$front"*) exit 0;; esac; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d \' \'); done; exit 1';
+
 /** Встроенные команды по умолчанию для всех платформ. */
 export const DEFAULT_COMMANDS: Record<Platform, CommandSet> = {
 	darwin: {
 		sound: "afplay /System/Library/Sounds/Glass.aiff",
 		push:
 			'osascript -e \'display notification (system attribute "PI_NOTIFY_MESSAGE") with title (system attribute "PI_NOTIFY_TITLE")\'',
+		focus: DARWIN_FOCUS_SH,
 	},
 	win32: {
 		sound: `powershell -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_MP3_PS)}`,
 		push: `powershell -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_TOAST_PS)}`,
+		focus: `powershell -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_FOCUS_PS)}`,
 	},
 	// WSL: тот же Windows-тост/звук, но через `powershell.exe` (interop-имя).
 	// Текст и путь к звуку доходят через env + WSLENV (см. buildEnv в notify.ts).
 	wsl: {
 		sound: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_MP3_PS)}`,
 		push: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_TOAST_PS)}`,
+		focus: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_FOCUS_PS)}`,
 	},
 	linux: {
 		// Пакетный набор: пробуем PulseAudio, потом ALSA, потом молча пропускаем.
 		sound:
 			"paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || aplay /usr/share/sounds/alsa/Complete.oga 2>/dev/null || true",
 		push: 'notify-send "$PI_NOTIFY_TITLE" "$PI_NOTIFY_MESSAGE"',
+		focus: LINUX_FOCUS_SH,
 	},
 };
 
@@ -194,6 +288,11 @@ export const DEFAULT_CONFIG: NotifyConfig = {
 	onQuestion: true,
 	questionTitle: "Pi: вопрос",
 	requireUI: true,
+	onlyWhenUnfocused: true,
+	focusedGraceSeconds: 60,
+	presenceWindowSeconds: 10,
+	focusFallback: true,
+	focusQueryTimeoutMs: 2000,
 	soundFile: null,
 	soundDurationMs: 5000,
 	volume: 0.4,
@@ -233,8 +332,10 @@ export function mergeCommands(value: unknown, defaults: Record<Platform, Command
 		if (!isPlatform(plat) || !isRecord(set)) continue;
 		const sound = set.sound;
 		const push = set.push;
+		const focus = set.focus;
 		if (typeof sound === "string") out[plat].sound = sound;
 		if (typeof push === "string") out[plat].push = push;
+		if (typeof focus === "string") out[plat].focus = focus;
 	}
 	return out;
 }
@@ -260,6 +361,21 @@ export function mergeConfig(fileObj: unknown, defaults: NotifyConfig): NotifyCon
 				? fileObj.questionTitle
 				: defaults.questionTitle,
 		requireUI: typeof fileObj.requireUI === "boolean" ? fileObj.requireUI : defaults.requireUI,
+		onlyWhenUnfocused:
+			typeof fileObj.onlyWhenUnfocused === "boolean" ? fileObj.onlyWhenUnfocused : defaults.onlyWhenUnfocused,
+		focusedGraceSeconds:
+			typeof fileObj.focusedGraceSeconds === "number" && fileObj.focusedGraceSeconds >= 0
+				? fileObj.focusedGraceSeconds
+				: defaults.focusedGraceSeconds,
+		presenceWindowSeconds:
+			typeof fileObj.presenceWindowSeconds === "number" && fileObj.presenceWindowSeconds >= 0
+				? fileObj.presenceWindowSeconds
+				: defaults.presenceWindowSeconds,
+		focusFallback: typeof fileObj.focusFallback === "boolean" ? fileObj.focusFallback : defaults.focusFallback,
+		focusQueryTimeoutMs:
+			typeof fileObj.focusQueryTimeoutMs === "number" && fileObj.focusQueryTimeoutMs > 0
+				? fileObj.focusQueryTimeoutMs
+				: defaults.focusQueryTimeoutMs,
 		soundFile:
 			typeof fileObj.soundFile === "string" && fileObj.soundFile.length > 0
 				? fileObj.soundFile
@@ -301,6 +417,20 @@ export function applyEnvOverrides(
 	if (env.PI_NOTIFY_TITLE && env.PI_NOTIFY_TITLE.length > 0) out.title = env.PI_NOTIFY_TITLE;
 	out.onQuestion = boolFromEnv(env.PI_NOTIFY_QUESTION, out.onQuestion);
 	out.requireUI = boolFromEnv(env.PI_NOTIFY_REQUIRE_UI, out.requireUI);
+	out.onlyWhenUnfocused = boolFromEnv(env.PI_NOTIFY_ONLY_WHEN_UNFOCUSED, out.onlyWhenUnfocused);
+	out.focusFallback = boolFromEnv(env.PI_NOTIFY_FOCUS_FALLBACK, out.focusFallback);
+	if (env.PI_NOTIFY_FOCUS_GRACE) {
+		const n = Number(env.PI_NOTIFY_FOCUS_GRACE);
+		if (Number.isFinite(n) && n >= 0) out.focusedGraceSeconds = n;
+	}
+	if (env.PI_NOTIFY_FOCUS_PRESENCE) {
+		const n = Number(env.PI_NOTIFY_FOCUS_PRESENCE);
+		if (Number.isFinite(n) && n >= 0) out.presenceWindowSeconds = n;
+	}
+	if (env.PI_NOTIFY_FOCUS_TIMEOUT) {
+		const n = Number(env.PI_NOTIFY_FOCUS_TIMEOUT);
+		if (Number.isFinite(n) && n > 0) out.focusQueryTimeoutMs = n;
+	}
 	if (env.PI_NOTIFY_QUESTION_TITLE && env.PI_NOTIFY_QUESTION_TITLE.length > 0) {
 		out.questionTitle = env.PI_NOTIFY_QUESTION_TITLE;
 	}
@@ -317,10 +447,11 @@ export function applyEnvOverrides(
 		const n = Number(env.PI_NOTIFY_MIN_DURATION);
 		if (Number.isFinite(n) && n >= 0) out.minDurationSeconds = n;
 	}
-	// Переопределение команд текущей платформы: PI_NOTIFY_CMD_SOUND / PI_NOTIFY_CMD_PUSH.
+	// Переопределение команд текущей платформы: PI_NOTIFY_CMD_SOUND / PI_NOTIFY_CMD_PUSH / PI_NOTIFY_CMD_FOCUS.
 	const plat = currentPlatform();
 	if (env.PI_NOTIFY_CMD_SOUND) out.commands[plat] = { ...out.commands[plat], sound: env.PI_NOTIFY_CMD_SOUND };
 	if (env.PI_NOTIFY_CMD_PUSH) out.commands[plat] = { ...out.commands[plat], push: env.PI_NOTIFY_CMD_PUSH };
+	if (env.PI_NOTIFY_CMD_FOCUS) out.commands[plat] = { ...out.commands[plat], focus: env.PI_NOTIFY_CMD_FOCUS };
 	return out;
 }
 
