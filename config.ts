@@ -30,7 +30,12 @@ export type Outcome = "completed" | "aborted" | "error";
  * Платформы. `wsl` — Linux-ядро WSL, где нативных аудио/нотификаций нет, и
  * пуш/звук направляются в Windows через interop (`powershell.exe`). Node внутри
  * WSL сообщает `process.platform === "linux"`, поэтому WSL определяется
- * отдельно (см. isWsl) и получает собственный набор команд.
+ * отдельно (см. isWsl, wslFromProcVersion) и получает собственный набор команд.
+ *
+ * Одних переменных окружения мало: `WSL_DISTRO_NAME`/`WSL_INTEROP` отсутствуют в
+ * окружении, которое их не экспортирует (tmux без `update-environment`, systemd,
+ * cron, harness-обёртки). Тогда остаётся признак ядра в `/proc/version` — он не
+ * зависит от окружения процесса.
  */
 export type Platform = "darwin" | "win32" | "linux" | "wsl";
 
@@ -140,6 +145,9 @@ const ALL_OUTCOMES: Outcome[] = ["completed", "aborted", "error"];
  * (UTF-16LE base64), чтобы избежать проблем с кавычками при запуске.
  */
 const WIN_TOAST_PS = [
+	// Записи потока progress в неинтерактивном PowerShell уходят в stderr как
+	// CLIXML. Для тоста они мусор, а в логах выглядят как ошибка.
+	"$ProgressPreference = 'SilentlyContinue'",
 	"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null",
 	"$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)",
 	"$n = $t.GetElementsByTagName('text')",
@@ -156,6 +164,7 @@ const WIN_TOAST_PS = [
  * чтобы блоки `if` парсились корректно.
  */
 const WIN_MP3_PS = [
+	"$ProgressPreference = 'SilentlyContinue'",
 	"[Windows.Media.Core.MediaSource, Windows.Media.Core, ContentType=WindowsRuntime] | Out-Null",
 	"[Windows.Media.Playback.MediaPlayer, Windows.Media.Playback, ContentType=WindowsRuntime] | Out-Null",
 	"$f = $env:PI_NOTIFY_SOUND_FILE",
@@ -249,6 +258,19 @@ const DARWIN_FOCUS_SH =
 	"p=$$; while [ -n \"$p\" ] && [ \"$p\" -gt 0 ]; do c=$(ps -o comm= -p \"$p\" 2>/dev/null); " +
 	'case "$c" in *"$front"*) exit 0;; esac; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d \' \'); done; exit 1';
 
+/**
+ * Запуск PowerShell из WSL.
+ *
+ * Interop-имя `powershell.exe` резолвится только когда Windows-`PATH` дошёл до
+ * Linux-`PATH`. В урезанном окружении (сервис, cron, обёртка без Windows-каталогов)
+ * не доходит, и голое имя даёт «command not found». Поэтому сначала абсолютный
+ * путь, голое имя — запасной вариант. Строка подставляется в начало команды и
+ * исполняется тем же `sh -c`, что и команда канала.
+ */
+export const WSL_PS =
+	"ps='/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'; " +
+	'[ -x "$ps" ] || ps=powershell.exe; "$ps"';
+
 /** Встроенные команды по умолчанию для всех платформ. */
 export const DEFAULT_COMMANDS: Record<Platform, CommandSet> = {
 	darwin: {
@@ -262,12 +284,12 @@ export const DEFAULT_COMMANDS: Record<Platform, CommandSet> = {
 		push: `powershell -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_TOAST_PS)}`,
 		focus: `powershell -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_FOCUS_PS)}`,
 	},
-	// WSL: тот же Windows-тост/звук, но через `powershell.exe` (interop-имя).
-	// Текст и путь к звуку доходят через env + WSLENV (см. buildEnv в notify.ts).
+	// WSL: тот же Windows-тост/звук, но через `powershell.exe` (interop-имя,
+	// см. WSL_PS). Текст и путь к звуку доходят через env + WSLENV (buildEnv в notify.ts).
 	wsl: {
-		sound: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_MP3_PS)}`,
-		push: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_TOAST_PS)}`,
-		focus: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_FOCUS_PS)}`,
+		sound: `${WSL_PS} -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_MP3_PS)}`,
+		push: `${WSL_PS} -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_TOAST_PS)}`,
+		focus: `${WSL_PS} -NoProfile -NonInteractive -EncodedCommand ${psEncode(WIN_FOCUS_PS)}`,
 	},
 	linux: {
 		// Пакетный набор: пробуем PulseAudio, потом ALSA, потом молча пропускаем.
@@ -457,22 +479,85 @@ export function applyEnvOverrides(
 
 /**
  * Признак WSL по окружению. WSL задаёт WSL_DISTRO_NAME и WSL_INTEROP в любом
- * дистрибутиве. Чистая функция от env — тестируется офлайн.
+ * дистрибутиве, но НЕ гарантирует, что они дойдут до процесса: tmux их не
+ * передаёт в новые сессии, systemd и cron их не видят. Поэтому это только
+ * первый источник, второй — wslFromProcVersion. Чистая функция от env.
  */
 export function isWsl(env: Record<string, string | undefined> = process.env): boolean {
 	return Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP);
 }
 
 /**
- * Платформа по умолчанию из process.platform с поправкой на WSL:
- * Linux-ядро + признаки WSL → "wsl" (бить в Windows, не в нативный Linux).
+ * Признак WSL по содержимому `/proc/version`: ядро WSL подписано
+ * `-microsoft-standard-WSL1` / `-microsoft-standard-WSL2`. Чистая функция от
+ * текста — тестируется офлайн, окружение процесса не нужно.
  */
-export function currentPlatform(env: Record<string, string | undefined> = process.env): Platform {
-	const p = process.platform;
-	if (p === "darwin") return "darwin";
-	if (p === "win32") return "win32";
-	if (isWsl(env)) return "wsl";
+export function wslFromProcVersion(procVersion: string): boolean {
+	return /microsoft-standard-WSL/i.test(procVersion);
+}
+
+/** Кэш прочитанных системных файлов: /proc/version и /etc/os-release за процесс не меняются. */
+const textCache = new Map<string, string>();
+
+/** Прочитать текстовый файл; нет файла или нет прав — пустая строка. */
+function readTextIfExists(path: string): string {
+	const cached = textCache.get(path);
+	if (cached !== undefined) return cached;
+	let text = "";
+	try {
+		text = readFileSync(path, "utf8");
+	} catch {
+		text = "";
+	}
+	textCache.set(path, text);
+	return text;
+}
+
+/**
+ * Разрешить платформу по всем трём источникам. Чистая функция — аргументы
+ * приходят извне, поэтому тестируется на любой ОС.
+ */
+export function platformFrom(
+	nodePlatform: string,
+	env: Record<string, string | undefined>,
+	procVersion: string,
+): Platform {
+	if (nodePlatform === "darwin") return "darwin";
+	if (nodePlatform === "win32") return "win32";
+	if (isWsl(env) || wslFromProcVersion(procVersion)) return "wsl";
 	return "linux";
+}
+
+/**
+ * Платформа по умолчанию: process.platform + env + `/proc/version`.
+ * Linux-ядро с признаком WSL → "wsl" (бить в Windows, не в нативный Linux).
+ */
+export function currentPlatform(
+	env: Record<string, string | undefined> = process.env,
+	procVersion = readTextIfExists("/proc/version"),
+): Platform {
+	return platformFrom(process.platform, env, procVersion);
+}
+
+/**
+ * Имя дистрибутива для Windows-UNC `\\wsl.localhost\<distro>\...`.
+ *
+ * Порядок: `WSL_DISTRO_NAME`, затем `NAME`/`PRETTY_NAME` из `/etc/os-release`
+ * (первое слово — «Ubuntu» для `Ubuntu 24.04.4 LTS`), затем «Ubuntu» как самое
+ * частое зарегистрированное имя. Имя нужно только для пути звука: тост и
+ * запрос фокуса путей не читают.
+ */
+export function wslDistroName(
+	env: Record<string, string | undefined> = process.env,
+	osRelease = readTextIfExists("/etc/os-release"),
+): string {
+	const fromEnv = env.WSL_DISTRO_NAME?.trim();
+	if (fromEnv) return fromEnv;
+	const name = /^NAME="([^"]+)"/m.exec(osRelease)?.[1]?.trim();
+	if (name) return name.split(/\s+/)[0];
+	const pretty = /^PRETTY_NAME="([^"]+)"/m.exec(osRelease)?.[1]?.trim();
+	if (pretty) return pretty.split(/\s+/)[0];
+	return "Ubuntu";
 }
 
 /** Путь к встроенному звуку пакета: `assets/notify.mp3` рядом с модулем. */
@@ -502,10 +587,7 @@ export function resolveSoundFile(
 	env: Record<string, string | undefined> = process.env,
 ): string {
 	const raw = cfg.soundFile && cfg.soundFile.length > 0 ? cfg.soundFile : bundledSoundPath();
-	if (platform === "wsl") {
-		const distro = env.WSL_DISTRO_NAME ?? "Ubuntu";
-		return wslPathToWindows(raw, distro);
-	}
+	if (platform === "wsl") return wslPathToWindows(raw, wslDistroName(env));
 	return raw;
 }
 

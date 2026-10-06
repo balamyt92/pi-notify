@@ -191,9 +191,15 @@ pi-notify и шлёт свой `agent_settled`-пуш с текстом свое
 - фокус: `xdotool getactivewindow getwindowpid` → pid активного окна, проверка, есть ли он среди предков процесса. Wayland так не определяется — там остаётся DECSET 1004
 
 **WSL (`wsl`)**
-- звук: `powershell.exe` + WinRT `MediaPlayer` играет `PI_NOTIFY_SOUND_FILE` (MP3/WAV) на Windows
-- пуш: `powershell.exe` → Windows toast (WinRT)
-- фокус: `powershell.exe` + `user32`, как в `win32`
+- звук: PowerShell + WinRT `MediaPlayer` играет `PI_NOTIFY_SOUND_FILE` (MP3/WAV) на Windows
+- пуш: PowerShell → Windows toast (WinRT)
+- фокус: PowerShell + `user32`, как в `win32`
+
+PowerShell ищется по абсолютному пути `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`,
+голоe interop-имя `powershell.exe` — запасной вариант. Interop-имя резолвится только
+когда Windows-`PATH` дошёл до Linux-`PATH`; в урезанном окружении (сервис, cron) не
+доходит. Все три скрипта начинаются с `$ProgressPreference = 'SilentlyContinue'`,
+иначе неинтерактивный PowerShell пишет записи progress в stderr как CLIXML.
 
 Список имён процессов, считающихся терминалом, расширяется переменной
 `PI_NOTIFY_FOCUS_PROCESSES` (имена через запятую, без `.exe`). В WSL переменная
@@ -223,7 +229,7 @@ pi-notify и шлёт свой `agent_settled`-пуш с текстом свое
 }
 ```
 
-В WSL относительный/WSL-путь автоматически конвертируется в UNC `\\wsl.localhost\<distro>\...`, чтобы `powershell.exe` прочитал файл из Linux-дерева. Уже windows-путь (`C:\...` или `\\...`) остаётся как есть.
+В WSL относительный/WSL-путь автоматически конвертируется в UNC `\\wsl.localhost\<distro>\...`, чтобы PowerShell прочитал файл из Linux-дерева. Имя дистрибутива берётся из `WSL_DISTRO_NAME`, при её отсутствии — из `NAME`/`PRETTY_NAME` в `/etc/os-release` (первое слово), и только потом — `Ubuntu` как самое частое зарегистрированное имя. Уже windows-путь (`C:\...` или `\\...`) остаётся как есть.
 
 `soundDurationMs` — фиксированный сон плеера. Событие `MediaEnded` в Windows PowerShell 5.1 не отдаётся, поэтому длительность задаётся явно и должна покрывать файл с запасом. Для встроенного `notify.mp3` (~1.8 с) дефолта 5000 мс хватает.
 
@@ -244,7 +250,11 @@ pi-notify и шлёт свой `agent_settled`-пуш с текстом свое
 
 В WSL2 Node сообщает `process.platform === "linux"`, но нативного звука и нотификаций в Linux-ядре нет — аудиосистема и тосты живут на Windows. Родные `paplay`/`notify-send` либо отсутствуют, либо не выводят ничего слышимого.
 
-Поэтому расширение определяет WSL (по `WSL_DISTRO_NAME` / `WSL_INTEROP`) и для него шлёт уведомление в Windows через interop: `powershell.exe` с тем же тостом/звуком, что и на нативном Windows.
+Поэтому расширение определяет WSL и для него шлёт уведомление в Windows через interop: PowerShell с тем же тостом/звуком, что и на нативном Windows.
+
+**Два признака WSL.** Первый — переменные `WSL_DISTRO_NAME` / `WSL_INTEROP`. Они задаются не во всех окружениях: tmux не передаёт их в новые сессии, systemd и cron их не видят. Второй признак — подпись ядра в `/proc/version` (`-microsoft-standard-WSL1` / `-microsoft-standard-WSL2`). Она не зависит от окружения процесса и спасает ровно в тех случаях, где переменных нет. Признак точный: ядра Azure/CBL-Mariner тоже содержат слово `microsoft`, но не `microsoft-standard-WSL`.
+
+Если не сработал ни один признак, платформа считается `linux` и каналы бьют в `paplay`/`notify-send`. Проверить разрешение на своей машине: `/notify-status` — в строке `title=... platform=...` должно быть `wsl`.
 
 **Проброс текста через границу WSL→Windows.** WSL не передаёт произвольные Linux-переменные окружения в Windows-процессы. Для этого служит `WSLENV` — список имён, которые разрешено переносить. Расширение само добавляет `PI_NOTIFY_TITLE:PI_NOTIFY_MESSAGE:PI_NOTIFY_OUTCOME:PI_NOTIFY_DURATION:PI_NOTIFY_SOUND_FILE:PI_NOTIFY_SOUND_DURATION` в `WSLENV` дочернего процесса, сохраняя уже заданные вами записи. Значения передаются как есть (без флага `/p`, то есть без конвертации путей), кириллица и спецсимволы доходят корректно — проверено round-trip через UTF-8.
 

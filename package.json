@@ -1,6 +1,6 @@
 {
   "name": "pi-notify",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Нотификации Pi: звук и пуш на Windows, macOS и произвольный Linux-скрипт. Срабатывает на финальном settle прогона и на вопросе агента (ask_user_question), молчит, пока TUI в фокусе, текст передаётся через env-переменные.",
   "keywords": [
     "pi-package",

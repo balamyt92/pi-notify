@@ -15,8 +15,12 @@ import {
 	mergeCommands,
 	mergeConfig,
 	normalizeNotifyOn,
+	platformFrom,
 	psEncode,
 	resolveSoundFile,
+	WSL_PS,
+	wslDistroName,
+	wslFromProcVersion,
 	wslPathToWindows,
 } from "../config.ts";
 
@@ -133,11 +137,61 @@ test("isWsl: true по WSL_DISTRO_NAME или WSL_INTEROP", () => {
 	assert.equal(isWsl({ WSL_DISTRO_NAME: "" }), false);
 });
 
-test("DEFAULT_COMMANDS.wsl использует powershell.exe (interop-имя)", () => {
-	assert.match(DEFAULT_COMMANDS.wsl.sound!, /^powershell\.exe /);
-	assert.match(DEFAULT_COMMANDS.wsl.push!, /^powershell\.exe /);
-	// нативный win32 — без .exe
+test("wslFromProcVersion: признак именно WSL-ядра", () => {
+	assert.equal(wslFromProcVersion("Linux version 6.18.33.2-microsoft-standard-WSL2 (root@host) gcc"), true);
+	assert.equal(wslFromProcVersion("Linux version 4.4.0-19041-microsoft-standard-WSL1"), true);
+	assert.equal(wslFromProcVersion("Linux version 6.5.0-27-generic (buildd@lcy02)"), false);
+	// Ядра Azure/CBL-Mariner тоже содержат «microsoft» — признак обязан быть точным.
+	assert.equal(wslFromProcVersion("Linux version 5.15.0.1-microsoft-azure (microsoft.com)"), false);
+	assert.equal(wslFromProcVersion(""), false);
+});
+
+test("platformFrom: darwin/win32 не зависят от признаков WSL", () => {
+	assert.equal(platformFrom("darwin", {}, "Linux-microsoft-standard-WSL2"), "darwin");
+	assert.equal(platformFrom("win32", { WSL_DISTRO_NAME: "Ubuntu" }, ""), "win32");
+});
+
+test("platformFrom: linux + любой признак WSL → wsl", () => {
+	assert.equal(platformFrom("linux", { WSL_DISTRO_NAME: "Ubuntu" }, ""), "wsl");
+	// Регрессия: env пуст (tmux/systemd), спасает только /proc/version.
+	assert.equal(platformFrom("linux", {}, "Linux version 6.18.33.2-microsoft-standard-WSL2"), "wsl");
+	assert.equal(platformFrom("linux", {}, "Linux version 6.5.0-27-generic"), "linux");
+	assert.equal(platformFrom("linux", {}, ""), "linux");
+});
+
+test("wslDistroName: env → os-release → Ubuntu", () => {
+	assert.equal(wslDistroName({ WSL_DISTRO_NAME: "Debian" }, 'NAME="Ubuntu"'), "Debian");
+	assert.equal(wslDistroName({}, 'PRETTY_NAME="Ubuntu 24.04.4 LTS"\nNAME="Ubuntu"\n'), "Ubuntu");
+	assert.equal(wslDistroName({}, 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nNAME="Debian"\n'), "Debian");
+	// os-release без NAME — берём первое слово PRETTY_NAME.
+	assert.equal(wslDistroName({}, 'PRETTY_NAME="Ubuntu 24.04.4 LTS"\n'), "Ubuntu");
+	assert.equal(wslDistroName({}, ""), "Ubuntu");
+});
+
+test("currentPlatform: явный procVersion снимает зависимость от хоста", () => {
+	const plat = currentPlatform({ WSL_DISTRO_NAME: "Ubuntu" }, "");
+	assert.equal(plat, process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "win32" : "wsl");
+});
+
+test("DEFAULT_COMMANDS.wsl: PowerShell по абсолютному пути с запасным interop-именем", () => {
+	for (const kind of ["sound", "push", "focus"] as const) {
+		const cmd = DEFAULT_COMMANDS.wsl[kind]!;
+		assert.ok(cmd.startsWith(WSL_PS), `wsl.${kind} не начинается с WSL_PS`);
+		assert.match(cmd, /\/mnt\/c\/Windows\/System32\/WindowsPowerShell\/v1\.0\/powershell\.exe/);
+		assert.match(cmd, /\|\| ps=powershell\.exe/);
+		assert.match(cmd, /-EncodedCommand /);
+	}
+	// нативный win32 — без .exe и без WSL-пути
 	assert.match(DEFAULT_COMMANDS.win32.push!, /^powershell /);
+	assert.doesNotMatch(DEFAULT_COMMANDS.win32.push!, /\/mnt\/c\//);
+});
+
+test("PowerShell-скрипты звука и тоста глушат progress-поток (нет CLIXML в stderr)", () => {
+	for (const kind of ["sound", "push"] as const) {
+		const encoded = DEFAULT_COMMANDS.wsl[kind]!.split(" -EncodedCommand ")[1];
+		const script = Buffer.from(encoded, "base64").toString("utf16le");
+		assert.match(script, /^\$ProgressPreference = 'SilentlyContinue'/);
+	}
 });
 
 test("normalizeNotifyOn: filters valid, dedups, keeps fallback on empty", () => {
